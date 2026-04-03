@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Bloom — Dating App</title>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #0d0d14; overflow: hidden; }
+    input::placeholder, textarea::placeholder { color: rgba(255,255,255,0.3); }
+    ::-webkit-scrollbar { width: 0; }
+    select option { background: #1a1a2e; color: #fff; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.1); border-top-color: #e74c8b; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+    @keyframes fadeUp { from { opacity:0; transform:translateY(18px); } to { opacity:1; transform:translateY(0); } }
+    .fade-up { animation: fadeUp 0.35s ease forwards; }
+  </style>
+
+  <script type="module">
+    import { initializeApp }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+             signOut, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, updateProfile }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+    import { getFirestore, doc, setDoc, getDoc, getDocs, collection, query,
+             where, onSnapshot, addDoc, serverTimestamp, orderBy, updateDoc, arrayUnion }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+    import { getStorage, ref, uploadBytes, getDownloadURL }
+      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
+
+    // ── Firebase init ──────────────────────────────────────────────────────────
+    const app = initializeApp({
+      apiKey: "AIzaSyCMRjLKxAQKtAFhqKAr68Nbz_tgXGlpKGc",
+      authDomain: "temwani-ac3ff.firebaseapp.com",
+      databaseURL: "https://temwani-ac3ff-default-rtdb.firebaseio.com",
+      projectId: "temwani-ac3ff",
+      storageBucket: "temwani-ac3ff.firebasestorage.app",
+      messagingSenderId: "890785950410",
+      appId: "1:890785950410:web:a1e9b0dbf7e39c255be233",
+      measurementId: "G-PMWVL66BMC"
+    });
+    const auth    = getAuth(app);
+    const db      = getFirestore(app);
+    const storage = getStorage(app);
+    const gProvider = new GoogleAuthProvider();
+
+    // ── App state ─────────────────────────────────────────────────────────────
+    let me = null, myProfile = null;
+    let discover = [], discoverIdx = 0;
+    let chats = [], activeChat = null, unsubChat = null, unsubMatches = null;
+    let currentScreen = "loading";
+    let authMode = "login";
+    let uploadedPhotoFile = null;
+
+    const IS = "padding:13px 16px;border-radius:14px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);color:#fff;font-size:14px;font-family:'DM Sans',sans-serif;outline:none;width:100%;";
+    const GRAD = "linear-gradient(135deg,#e74c8b,#f59e0b)";
+    const PF_PH = "https://images.unsplash.com/photo-1511367461989-f85a21fda167?w=400&h=600&fit=crop";
+
+    // ── Auth observer ─────────────────────────────────────────────────────────
+    onAuthStateChanged(auth, async user => {
+      me = user;
+      if (user) {
+        const snap = await getDoc(doc(db, "users", user.uid));
+        if (snap.exists()) {
+          myProfile = snap.data();
+          await fetchDiscover();
+          subscribeMatches();
+          go("discover");
+        } else {
+          go("onboarding");
+        }
+      } else {
+        go("auth");
+      }
+    });
+
+    // ── Fetch profiles to discover ────────────────────────────────────────────
+    async function fetchDiscover() {
+      const snap = await getDocs(collection(db, "users"));
+      const seen = new Set(myProfile?.swipedOn || []);
+      discover = [];
+      snap.forEach(d => { if (d.id !== me.uid && !seen.has(d.id)) discover.push({ id: d.id, ...d.data() }); });
+      discoverIdx = 0;
+    }
+
+    // ── Swipe ─────────────────────────────────────────────────────────────────
+    async function doSwipe(dir, pid) {
+      await updateDoc(doc(db, "users", me.uid), { swipedOn: arrayUnion(pid) });
+      myProfile.swipedOn = [...(myProfile.swipedOn || []), pid];
+      if (dir === "right") {
+        const theirSnap = await getDoc(doc(db, "users", pid));
+        const theirData = theirSnap.data() || {};
+        if ((theirData.likedBy || []).includes(me.uid)) {
+          const mid = [me.uid, pid].sort().join("_");
+          await setDoc(doc(db, "matches", mid), { users: [me.uid, pid], createdAt: serverTimestamp() }, { merge: true });
+          showMatchModal(discover.find(p => p.id === pid));
+        } else {
+          await updateDoc(doc(db, "users", pid), { likedBy: arrayUnion(me.uid) });
+        }
+      }
+      discoverIdx++;
+      renderDiscover();
+    }
+
+    // ── Subscribe matches ─────────────────────────────────────────────────────
+    function subscribeMatches() {
+      if (unsubMatches) unsubMatches();
+      const q = query(collection(db, "matches"), where("users", "array-contains", me.uid));
+      unsubMatches = onSnapshot(q, async snap => {
+        chats = [];
+        for (const d of snap.docs) {
+          const data = d.data();
+          const otherId = data.users.find(u => u !== me.uid);
+          const [otherSnap, msgSnap] = await Promise.all([
+            getDoc(doc(db, "users", otherId)),
+            getDocs(query(collection(db, "matches", d.id, "messages"), orderBy("createdAt", "desc")))
+          ]);
+          const last = msgSnap.docs[0]?.data();
+          chats.push({
+            matchId: d.id, otherId,
+            name: otherSnap.data()?.name || "User",
+            photo: otherSnap.data()?.photo || "",
+            lastMsg: last?.text || "Say hello! 👋",
+            time: last?.createdAt?.toDate?.()?.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" }) || ""
+          });
+        }
+        if (currentScreen === "messages" && !activeChat) renderMessages();
+      });
+    }
+
+    // ── Open chat ─────────────────────────────────────────────────────────────
+    function openChat(chat) {
+      activeChat = chat;
+      if (unsubChat) unsubChat();
+      renderChat();
+      const q = query(collection(db, "matches", chat.matchId, "messages"), orderBy("createdAt", "asc"));
+      unsubChat = onSnapshot(q, snap => {
+        const msgs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        renderChatMsgs(msgs);
+      });
+    }
+
+    async function sendMsg(text) {
+      if (!text.trim() || !activeChat) return;
+      await addDoc(collection(db, "matches", activeChat.matchId, "messages"), {
+        from: me.uid, text: text.trim(), createdAt: serverTimestamp()
+      });
+    }
+
+    // ── Save profile ──────────────────────────────────────────────────────────
+    async function saveProfile(data) {
+      await setDoc(doc(db, "users", me.uid), { ...data, likedBy: [], swipedOn: [], uid: me.uid, createdAt: serverTimestamp() }, { merge: true });
+      myProfile = { ...myProfile, ...data };
+    }
+
+    async function uploadPhoto(file) {
+      const r = ref(storage, `photos/${me.uid}/${Date.now()}`);
+      await uploadBytes(r, file);
+      return getDownloadURL(r);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RENDER
+    // ═══════════════════════════════════════════════════════════════════════════
+    const root = () => document.getElementById("root");
+
+    function go(s) {
+      currentScreen = s;
+      if (unsubChat && s !== "messages") { unsubChat(); unsubChat = null; }
+      if (s !== "messages") activeChat = null;
+      render();
+    }
+
+    function render() {
+      const r = root();
+      r.innerHTML = "";
+      const wrap = el("div", { style:"font-family:'DM Sans',sans-serif;background:#0d0d14;height:100vh;max-width:430px;margin:0 auto;display:flex;flex-direction:column;overflow:hidden;color:#fff;" });
+      r.appendChild(wrap);
+
+      if (currentScreen === "loading") { wrap.innerHTML = loadingHTML(); return; }
+      if (currentScreen === "auth")       { wrap.innerHTML = authHTML();       return; }
+      if (currentScreen === "onboarding") { wrap.innerHTML = onboardHTML();    return; }
+
+      // App screens with nav
+      const content = el("div", { id:"screen", style:"flex:1;overflow:hidden;display:flex;flex-direction:column;" });
+      wrap.appendChild(content);
+      wrap.appendChild(navHTML());
+
+      if (currentScreen === "discover")  renderDiscover();
+      else if (currentScreen === "likes")    renderLikes();
+      else if (currentScreen === "messages") renderMessages();
+      else if (currentScreen === "profile")  renderProfile();
+    }
+
+    // ── Loading ───────────────────────────────────────────────────────────────
+    function loadingHTML() {
+      return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+        <div class="spinner"></div>
+        <div style="font-family:'Playfair Display',serif;font-size:36px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;">Bloom</div>
+      </div>`;
+    }
+
+    // ── Auth ──────────────────────────────────────────────────────────────────
+    function authHTML() {
+      return `<div class="fade-up" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;overflow-y:auto;">
+        <div style="font-family:'Playfair Display',serif;font-size:52px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px;">Bloom</div>
+        <p style="color:rgba(255,255,255,0.38);font-size:14px;margin-bottom:36px;">Find your person 🌸</p>
+        <div style="display:flex;gap:0;margin-bottom:24px;background:rgba(255,255,255,0.06);border-radius:30px;padding:4px;width:100%;max-width:320px;">
+          <button id="tab-l" onclick="window._authMode('login')"  style="flex:1;padding:10px;border-radius:26px;border:none;background:${authMode==='login'?GRAD:'transparent'};color:#fff;font-family:'DM Sans',sans-serif;font-weight:600;font-size:14px;cursor:pointer;">Login</button>
+          <button id="tab-s" onclick="window._authMode('signup')" style="flex:1;padding:10px;border-radius:26px;border:none;background:${authMode==='signup'?GRAD:'transparent'};color:#fff;font-family:'DM Sans',sans-serif;font-weight:600;font-size:14px;cursor:pointer;">Sign Up</button>
+        </div>
+        <div style="width:100%;max-width:320px;display:flex;flex-direction:column;gap:11px;">
+          ${authMode==='signup'?`<input id="a-name" placeholder="Full Name" style="${IS}" />`:''}
+          <input id="a-email" type="email" placeholder="Email address" style="${IS}" />
+          <input id="a-pass"  type="password" placeholder="Password" style="${IS}" onkeydown="if(event.key==='Enter')window._authSubmit()" />
+          <div id="a-err" style="color:#e74c8b;font-size:12px;min-height:16px;text-align:center;"></div>
+          <button onclick="window._authSubmit()" style="padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;">${authMode==='login'?'Login':'Create Account'}</button>
+          <div style="text-align:center;color:rgba(255,255,255,0.25);font-size:13px;margin:2px 0;">or</div>
+          <button onclick="window._googleSignIn()" style="padding:14px;border-radius:50px;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.05);color:#fff;font-size:14px;font-family:'DM Sans',sans-serif;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;">
+            <svg width="18" height="18" viewBox="0 0 24 24"><path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+            Continue with Google
+          </button>
+        </div>
+      </div>`;
+    }
+
+    // ── Onboarding ────────────────────────────────────────────────────────────
+    function onboardHTML() {
+      return `<div class="fade-up" style="flex:1;overflow-y:auto;padding:28px 24px 40px;">
+        <div style="font-family:'Playfair Display',serif;font-size:24px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;">Complete Your Profile</div>
+        <p style="color:rgba(255,255,255,0.4);font-size:13px;margin-bottom:24px;">Help us find your perfect match</p>
+        <div style="display:flex;flex-direction:column;align-items:center;margin-bottom:22px;">
+          <div id="ph-prev" onclick="document.getElementById('ph-inp').click()" style="width:110px;height:110px;border-radius:50%;background:rgba(255,255,255,0.07);border:2px dashed rgba(255,255,255,0.2);display:flex;align-items:center;justify-content:center;font-size:36px;margin-bottom:10px;overflow:hidden;cursor:pointer;">📸</div>
+          <input id="ph-inp" type="file" accept="image/*" style="display:none;" onchange="window._prevPhoto(this)" />
+          <button onclick="document.getElementById('ph-inp').click()" style="padding:7px 18px;border-radius:20px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:rgba(255,255,255,0.55);font-size:13px;cursor:pointer;font-family:'DM Sans',sans-serif;">Upload Photo</button>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:11px;">
+          <input id="ob-name"     placeholder="Full Name *"  style="${IS}" />
+          <input id="ob-age"      type="number" placeholder="Age *" min="18" max="99" style="${IS}" />
+          <input id="ob-location" placeholder="Location (e.g. Accra, Ghana)" style="${IS}" />
+          <textarea id="ob-bio"   placeholder="Write a short bio..." rows="3" style="${IS}resize:none;"></textarea>
+          <select id="ob-goal"   style="${IS}">
+            <option value="" disabled selected>Looking for... *</option>
+            <option value="Serious">Serious Relationship</option>
+            <option value="Casual">Casual Dating</option>
+            <option value="Friendship">Friendship</option>
+          </select>
+          <select id="ob-gender" style="${IS}">
+            <option value="" disabled selected>Gender *</option>
+            <option value="Male">Male</option>
+            <option value="Female">Female</option>
+            <option value="Other">Other</option>
+          </select>
+          <input id="ob-interests" placeholder="Interests: Music, Travel, Art..." style="${IS}" />
+          <div id="ob-err" style="color:#e74c8b;font-size:13px;min-height:16px;text-align:center;"></div>
+          <button onclick="window._saveOnboard()" style="padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;margin-top:4px;">Start Matching 🌸</button>
+        </div>
+      </div>`;
+    }
+
+    // ── Nav ───────────────────────────────────────────────────────────────────
+    function navHTML() {
+      const tabs = [{id:"discover",icon:"🔥",label:"Discover"},{id:"likes",icon:"💜",label:"Likes"},{id:"messages",icon:"💬",label:"Chats"},{id:"profile",icon:"👤",label:"Profile"}];
+      const nav = el("nav", { style:"flex-shrink:0;background:rgba(10,10,18,0.97);backdrop-filter:blur(20px);border-top:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-around;padding:12px 0 18px;z-index:50;" });
+      tabs.forEach(t => {
+        const btn = el("button", {
+          onclick: `window._go('${t.id}')`,
+          style: `display:flex;flex-direction:column;align-items:center;gap:3px;background:none;border:none;cursor:pointer;color:${currentScreen===t.id?'#e74c8b':'rgba(255,255,255,0.32)'};font-size:10px;font-family:'DM Sans',sans-serif;font-weight:${currentScreen===t.id?700:400};min-width:60px;transition:color 0.2s;`
+        });
+        btn.innerHTML = `<span style="font-size:22px;line-height:1;">${t.icon}</span>${t.label}`;
+        nav.appendChild(btn);
+      });
+      return nav;
+    }
+
+    // ── Discover ──────────────────────────────────────────────────────────────
+    function renderDiscover() {
+      const sc = document.getElementById("screen");
+      if (!sc) return;
+      const p = discover[discoverIdx];
+      sc.innerHTML = `
+        <div style="padding:16px 20px 8px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;">
+          <div style="font-family:'Playfair Display',serif;font-size:28px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;">Bloom</div>
+          <div style="font-size:12px;color:rgba(255,255,255,0.3);">${discover.length - discoverIdx} profiles left</div>
+        </div>
+        <div style="flex:1;display:flex;align-items:center;justify-content:center;padding:0 16px;overflow:hidden;">
+          ${!p ? `
+          <div style="text-align:center;">
+            <div style="font-size:64px;margin-bottom:16px;">🌸</div>
+            <div style="font-family:'Playfair Display',serif;font-size:24px;margin-bottom:8px;">All caught up!</div>
+            <p style="color:rgba(255,255,255,0.4);font-size:14px;margin-bottom:20px;">No more new profiles right now</p>
+            <button onclick="window._reload()" style="padding:12px 28px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:14px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;">Refresh 🔄</button>
+          </div>` : `
+          <div id="card" style="position:relative;width:100%;max-width:380px;height:490px;border-radius:26px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,0.65);touch-action:none;user-select:none;">
+            <div id="like-s" style="position:absolute;top:50px;left:20px;border:4px solid #10b981;color:#10b981;font-family:'DM Sans',sans-serif;font-weight:700;font-size:26px;padding:5px 14px;border-radius:8px;transform:rotate(-15deg);opacity:0;z-index:10;pointer-events:none;letter-spacing:2px;">LIKE</div>
+            <div id="nope-s" style="position:absolute;top:50px;right:20px;border:4px solid #e74c8b;color:#e74c8b;font-family:'DM Sans',sans-serif;font-weight:700;font-size:26px;padding:5px 14px;border-radius:8px;transform:rotate(15deg);opacity:0;z-index:10;pointer-events:none;letter-spacing:2px;">NOPE</div>
+            <img src="${p.photo || PF_PH}" style="width:100%;height:100%;object-fit:cover;pointer-events:none;" draggable="false" onerror="this.src='${PF_PH}'" />
+            <div style="position:absolute;top:14px;right:14px;background:${GRAD};border-radius:20px;padding:5px 12px;font-size:11px;font-weight:700;">${p.goal || "Dating"}</div>
+            <div style="position:absolute;bottom:0;left:0;right:0;background:linear-gradient(to top,rgba(0,0,0,0.97) 0%,rgba(0,0,0,0.5) 55%,transparent 100%);padding:28px 20px 20px;">
+              <div style="font-family:'Playfair Display',serif;font-size:28px;font-weight:700;">${p.name || "User"}, ${p.age || ""}</div>
+              <div style="font-size:12px;color:rgba(255,255,255,0.5);margin:4px 0 8px;">📍 ${p.location || "Nearby"}</div>
+              <div style="font-size:13px;color:rgba(255,255,255,0.82);line-height:1.5;margin-bottom:10px;">${p.bio || ""}</div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;">${(p.interests||[]).map(i=>`<span style="padding:3px 10px;border-radius:20px;font-size:11px;background:rgba(255,255,255,0.12);">${i}</span>`).join("")}</div>
+            </div>
+          </div>`}
+        </div>
+        ${p ? `
+        <div style="display:flex;justify-content:center;align-items:center;gap:18px;padding:14px 0 6px;flex-shrink:0;">
+          <button onclick="window._swipe('left','${p.id}')" style="width:54px;height:54px;border-radius:50%;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);font-size:22px;cursor:pointer;color:#fff;transition:transform 0.15s;" onmousedown="this.style.transform='scale(0.9)'" onmouseup="this.style.transform=''">✕</button>
+          <button onclick="window._swipe('right','${p.id}')" style="width:68px;height:68px;border-radius:50%;border:none;background:${GRAD};font-size:28px;cursor:pointer;box-shadow:0 8px 28px rgba(231,76,139,0.5);transition:transform 0.15s;" onmousedown="this.style.transform='scale(0.9)'" onmouseup="this.style.transform=''">♥</button>
+          <button onclick="window._swipe('left','${p.id}')" style="width:54px;height:54px;border-radius:50%;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);font-size:22px;cursor:pointer;color:#fff;">⚡</button>
+        </div>` : ""}
+      `;
+      if (p) initCardSwipe(p.id);
+    }
+
+    function initCardSwipe(pid) {
+      const card = document.getElementById("card");
+      const ls = document.getElementById("like-s");
+      const ns = document.getElementById("nope-s");
+      if (!card) return;
+      let sx = null, dx = 0, done = false;
+      card.addEventListener("touchstart", e => { sx = e.touches[0].clientX; done = false; });
+      card.addEventListener("touchmove", e => {
+        if (!sx || done) return;
+        dx = e.touches[0].clientX - sx;
+        card.style.transform = `translateX(${dx}px) rotate(${dx*0.04}deg)`;
+        card.style.opacity = Math.max(0, 1 - Math.abs(dx)/300);
+        ls.style.opacity = dx > 40 ? Math.min(1,(dx-40)/80) : 0;
+        ns.style.opacity = dx < -40 ? Math.min(1,(-dx-40)/80) : 0;
+      });
+      card.addEventListener("touchend", () => {
+        if (done) return;
+        if (Math.abs(dx) > 90) {
+          done = true;
+          const dir = dx > 0 ? "right" : "left";
+          card.style.transition = "transform 0.35s ease, opacity 0.35s ease";
+          card.style.transform = `translateX(${dir==="right"?160:-160}%) rotate(${dir==="right"?25:-25}deg)`;
+          card.style.opacity = 0;
+          setTimeout(() => doSwipe(dir, pid), 360);
+        } else {
+          card.style.transform = "";
+          card.style.opacity = 1;
+          ls.style.opacity = 0;
+          ns.style.opacity = 0;
+        }
+        sx = null; dx = 0;
+      });
+    }
+
+    // ── Match modal ───────────────────────────────────────────────────────────
+    function showMatchModal(p) {
+      const ov = el("div", { style:"position:fixed;inset:0;background:rgba(6,6,14,0.96);z-index:300;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;text-align:center;font-family:'DM Sans',sans-serif;color:#fff;" });
+      ov.innerHTML = `
+        <div style="font-size:64px;margin-bottom:12px;">🎉</div>
+        <div style="font-family:'Playfair Display',serif;font-size:44px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px;">It's a Match!</div>
+        <p style="color:rgba(255,255,255,0.5);font-size:15px;margin-bottom:36px;">You and ${p?.name||"someone"} liked each other</p>
+        <div style="display:flex;justify-content:center;margin-bottom:44px;">
+          <img src="${myProfile?.photo||PF_PH}" style="width:100px;height:100px;border-radius:50%;object-fit:cover;border:3px solid #e74c8b;margin-right:-18px;z-index:1;position:relative;" onerror="this.src='${PF_PH}'" />
+          <img src="${p?.photo||PF_PH}" style="width:100px;height:100px;border-radius:50%;object-fit:cover;border:3px solid #f59e0b;" onerror="this.src='${PF_PH}'" />
+        </div>
+        <button id="mm-msg" style="width:100%;max-width:320px;padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;margin-bottom:12px;">Send a Message 💬</button>
+        <button id="mm-skip" style="width:100%;max-width:320px;padding:13px;border-radius:50px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:rgba(255,255,255,0.6);font-size:15px;font-family:'DM Sans',sans-serif;cursor:pointer;">Keep Swiping</button>
+      `;
+      document.body.appendChild(ov);
+      ov.querySelector("#mm-skip").onclick = () => ov.remove();
+      ov.querySelector("#mm-msg").onclick  = () => { ov.remove(); go("messages"); };
+    }
+
+    // ── Likes ─────────────────────────────────────────────────────────────────
+    function renderLikes() {
+      const sc = document.getElementById("screen");
+      if (!sc) return;
+      sc.innerHTML = `
+        <div style="padding:20px 22px 10px;font-family:'Playfair Display',serif;font-size:26px;font-style:italic;">Who Liked You</div>
+        <p style="padding:0 22px 14px;color:rgba(255,255,255,0.4);font-size:13px;">Upgrade to Premium to see who liked you 💖</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 16px;overflow-y:auto;flex:1;">
+          ${discover.slice(0,6).map(p=>`
+          <div style="border-radius:18px;overflow:hidden;position:relative;height:200px;">
+            <img src="${p.photo||PF_PH}" style="width:100%;height:100%;object-fit:cover;filter:blur(9px);transform:scale(1.1);" onerror="this.src='${PF_PH}'" />
+            <div style="position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,0.7),transparent);display:flex;flex-direction:column;justify-content:flex-end;padding:12px;">
+              <div style="font-weight:600;font-size:14px;">Someone, ${p.age||'?'}</div>
+            </div>
+            <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:30px;">🔒</div>
+          </div>`).join("")}
+        </div>
+        <div style="padding:16px;">
+          <button style="width:100%;padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;">Unlock Premium ✨</button>
+        </div>`;
+    }
+
+    // ── Messages list ─────────────────────────────────────────────────────────
+    function renderMessages() {
+      const sc = document.getElementById("screen");
+      if (!sc) return;
+      sc.innerHTML = `
+        <div style="padding:20px 22px 14px;font-family:'Playfair Display',serif;font-size:26px;font-style:italic;flex-shrink:0;">Messages</div>
+        <div style="flex:1;overflow-y:auto;">
+          ${chats.length === 0 ? `
+          <div style="text-align:center;padding:60px 32px;">
+            <div style="font-size:56px;margin-bottom:16px;">💬</div>
+            <div style="font-family:'Playfair Display',serif;font-size:22px;margin-bottom:8px;">No matches yet</div>
+            <p style="color:rgba(255,255,255,0.4);font-size:14px;">Keep swiping to get your first match!</p>
+          </div>` :
+          chats.map((c,i) => `
+          <div onclick="window._openChat(${i})" style="display:flex;align-items:center;gap:14px;padding:14px 22px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,0.05);transition:background 0.2s;" onmouseover="this.style.background='rgba(255,255,255,0.04)'" onmouseout="this.style.background='transparent'">
+            <img src="${c.photo||PF_PH}" style="width:56px;height:56px;border-radius:50%;object-fit:cover;flex-shrink:0;" onerror="this.src='${PF_PH}'" />
+            <div style="flex:1;min-width:0;">
+              <div style="font-weight:600;font-size:15px;margin-bottom:3px;">${c.name}</div>
+              <div style="font-size:13px;color:rgba(255,255,255,0.38);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.lastMsg}</div>
+            </div>
+            <div style="font-size:11px;color:rgba(255,255,255,0.25);flex-shrink:0;">${c.time}</div>
+          </div>`).join("")}
+        </div>`;
+    }
+
+    // ── Chat ──────────────────────────────────────────────────────────────────
+    function renderChat() {
+      const sc = document.getElementById("screen");
+      if (!sc || !activeChat) return;
+      sc.innerHTML = `
+        <div style="padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:12px;flex-shrink:0;">
+          <button onclick="window._go('messages')" style="background:none;border:none;color:rgba(255,255,255,0.6);font-size:26px;cursor:pointer;line-height:1;padding:0 6px 0 0;">‹</button>
+          <img src="${activeChat.photo||PF_PH}" style="width:44px;height:44px;border-radius:50%;object-fit:cover;" onerror="this.src='${PF_PH}'" />
+          <div style="flex:1;">
+            <div style="font-weight:600;font-size:15px;">${activeChat.name}</div>
+            <div style="font-size:11px;color:#10b981;">Matched ✓</div>
+          </div>
+          <button style="background:none;border:none;color:rgba(255,255,255,0.4);font-size:20px;cursor:pointer;">📞</button>
+        </div>
+        <div id="msgs" style="flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:6px;"></div>
+        <div style="padding:12px 16px 28px;display:flex;gap:10px;border-top:1px solid rgba(255,255,255,0.06);flex-shrink:0;">
+          <input id="m-inp" placeholder="Type a message…" style="flex:1;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.1);border-radius:24px;padding:12px 18px;color:#fff;font-size:14px;font-family:'DM Sans',sans-serif;outline:none;" onkeydown="if(event.key==='Enter')window._sendMsg()" />
+          <button onclick="window._sendMsg()" style="width:48px;height:48px;border-radius:50%;border:none;background:${GRAD};font-size:20px;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;">➤</button>
+        </div>`;
+    }
+
+    function renderChatMsgs(msgs) {
+      const c = document.getElementById("msgs");
+      if (!c) return;
+      c.innerHTML = msgs.map(m => `
+        <div style="display:flex;justify-content:${m.from===me.uid?'flex-end':'flex-start'};">
+          <div style="max-width:72%;padding:11px 15px;border-radius:${m.from===me.uid?'18px 18px 4px 18px':'18px 18px 18px 4px'};background:${m.from===me.uid?GRAD:'rgba(255,255,255,0.1)'};font-size:14px;line-height:1.45;font-family:'DM Sans',sans-serif;">${m.text}</div>
+        </div>`).join("");
+      c.scrollTop = c.scrollHeight;
+    }
+
+    // ── Profile ───────────────────────────────────────────────────────────────
+    function renderProfile() {
+      const sc = document.getElementById("screen");
+      if (!sc || !myProfile) return;
+      sc.innerHTML = `
+        <div style="flex:1;overflow-y:auto;padding-bottom:20px;">
+          <div style="padding:18px 22px 10px;display:flex;align-items:center;justify-content:space-between;">
+            <div style="font-family:'Playfair Display',serif;font-size:24px;font-style:italic;">My Profile</div>
+            <button onclick="window._signOut()" style="padding:7px 14px;border-radius:20px;border:1px solid rgba(255,80,80,0.4);background:transparent;color:rgba(255,80,80,0.8);font-size:12px;cursor:pointer;font-family:'DM Sans',sans-serif;">Sign Out</button>
+          </div>
+          <div style="margin:0 16px 14px;border-radius:22px;overflow:hidden;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);">
+            <img src="${myProfile.photo||PF_PH}" style="width:100%;height:240px;object-fit:cover;" onerror="this.src='${PF_PH}'" />
+            <div style="padding:18px 20px;">
+              <div style="font-family:'Playfair Display',serif;font-size:24px;margin-bottom:4px;">${myProfile.name||"You"}, ${myProfile.age||""}</div>
+              <div style="font-size:13px;color:rgba(255,255,255,0.4);margin-bottom:14px;">📍 ${myProfile.location||"Somewhere"} · ${myProfile.goal||"Dating"}</div>
+              <div style="display:flex;justify-content:space-around;padding:14px 0;border-top:1px solid rgba(255,255,255,0.07);border-bottom:1px solid rgba(255,255,255,0.07);margin-bottom:14px;">
+                ${[{n:discover.length,l:"Profiles"},{n:chats.length,l:"Matches"},{n:myProfile.gender||"—",l:"Gender"}].map(s=>`
+                <div style="text-align:center;">
+                  <div style="font-family:'Playfair Display',serif;font-size:20px;font-weight:700;">${s.n}</div>
+                  <div style="font-size:11px;color:rgba(255,255,255,0.38);margin-top:2px;">${s.l}</div>
+                </div>`).join("")}
+              </div>
+              <p style="font-size:13.5px;color:rgba(255,255,255,0.7);line-height:1.6;margin-bottom:14px;">${myProfile.bio||"No bio yet."}</p>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;">${(myProfile.interests||[]).map(t=>`<span style="padding:4px 12px;border-radius:20px;font-size:11px;background:rgba(255,255,255,0.1);">${t}</span>`).join("")}</div>
+            </div>
+          </div>
+          <div style="padding:0 16px;">
+            <button onclick="window._go('onboarding')" style="width:100%;padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;font-family:'DM Sans',sans-serif;cursor:pointer;">Edit Profile ✏️</button>
+          </div>
+        </div>`;
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function el(tag, attrs) {
+      const e = document.createElement(tag);
+      for (const [k,v] of Object.entries(attrs||{})) {
+        if (k === "onclick") e.onclick = typeof v === "string" ? new Function(v) : v;
+        else e.setAttribute(k, v);
+      }
+      return e;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // GLOBAL HANDLERS
+    // ═══════════════════════════════════════════════════════════════════════════
+    window._authMode = m => { authMode = m; go("auth"); };
+
+    window._authSubmit = async () => {
+      const email = document.getElementById("a-email")?.value?.trim();
+      const pass  = document.getElementById("a-pass")?.value;
+      const err   = document.getElementById("a-err");
+      if (!email || !pass) { if(err) err.textContent = "Please enter email and password."; return; }
+      try {
+        if (authMode === "signup") {
+          const name = document.getElementById("a-name")?.value?.trim();
+          const cred = await createUserWithEmailAndPassword(auth, email, pass);
+          if (name) await updateProfile(cred.user, { displayName: name });
+        } else {
+          await signInWithEmailAndPassword(auth, email, pass);
+        }
+      } catch(e) {
+        if (err) err.textContent = e.message.replace("Firebase: ","").replace(/\s*\(.*\)/,"");
+      }
+    };
+
+    window._googleSignIn = async () => {
+      try { await signInWithPopup(auth, gProvider); }
+      catch(e) { console.error("Google sign-in error:", e); }
+    };
+
+    window._prevPhoto = (input) => {
+      uploadedPhotoFile = input.files[0];
+      if (!uploadedPhotoFile) return;
+      const reader = new FileReader();
+      reader.onload = e => {
+        const prev = document.getElementById("ph-prev");
+        if (prev) prev.innerHTML = `<img src="${e.target.result}" style="width:100%;height:100%;object-fit:cover;" />`;
+      };
+      reader.readAsDataURL(uploadedPhotoFile);
+    };
+
+    window._saveOnboard = async () => {
+      const name      = document.getElementById("ob-name")?.value?.trim();
+      const age       = document.getElementById("ob-age")?.value;
+      const location  = document.getElementById("ob-location")?.value?.trim();
+      const bio       = document.getElementById("ob-bio")?.value?.trim();
+      const goal      = document.getElementById("ob-goal")?.value;
+      const gender    = document.getElementById("ob-gender")?.value;
+      const interests = document.getElementById("ob-interests")?.value?.split(",").map(s=>s.trim()).filter(Boolean);
+      const err       = document.getElementById("ob-err");
+      if (!name||!age||!goal||!gender) { if(err) err.textContent = "Please fill in all required fields (*)."; return; }
+      if (parseInt(age) < 18)          { if(err) err.textContent = "You must be at least 18."; return; }
+
+      if (err) err.textContent = "Saving…";
+      let photo = myProfile?.photo || "";
+      if (uploadedPhotoFile) {
+        try { photo = await uploadPhoto(uploadedPhotoFile); uploadedPhotoFile = null; }
+        catch(e) { console.error("Photo upload error:", e); }
+      }
+      try {
+        await saveProfile({ name, age:parseInt(age), location, bio, goal, gender, interests, photo });
+        await fetchDiscover();
+        subscribeMatches();
+        go("discover");
+      } catch(e) {
+        if (err) err.textContent = e.message;
+      }
+    };
+
+    window._swipe    = (dir, pid) => doSwipe(dir, pid);
+    window._reload   = async () => { await fetchDiscover(); renderDiscover(); };
+    window._openChat = i => openChat(chats[i]);
+    window._sendMsg  = () => {
+      const inp = document.getElementById("m-inp");
+      if (inp) { sendMsg(inp.value); inp.value = ""; }
+    };
+    window._signOut  = async () => {
+      if (unsubMatches) unsubMatches();
+      if (unsubChat) unsubChat();
+      await signOut(auth);
+    };
+    window._go = s => {
+      if (s === "messages" && activeChat) { activeChat = null; }
+      go(s);
+    };
+
+    // Boot
+    root().innerHTML = loadingHTML();
+  </script>
+</head>
+<body>
+  <div id="root" style="height:100%;"></div>
+</body>
+</html>
