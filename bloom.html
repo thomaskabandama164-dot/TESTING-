@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
+  <title>Bloom — Dating App</title>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet"/>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    html,body{height:100%;background:#0d0d14;overflow:hidden;font-family:'DM Sans',sans-serif;}
+    #root{height:100%;display:flex;flex-direction:column;max-width:430px;margin:0 auto;color:#fff;}
+    input,textarea,select{font-family:'DM Sans',sans-serif;}
+    input::placeholder,textarea::placeholder{color:rgba(255,255,255,0.3);}
+    select option{background:#1a1a2e;}
+    ::-webkit-scrollbar{width:0;}
+    button{cursor:pointer;font-family:'DM Sans',sans-serif;}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    @keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+    .spin{width:40px;height:40px;border:3px solid rgba(255,255,255,0.1);border-top-color:#e74c8b;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px;}
+    .fu{animation:fadeUp .35s ease forwards;}
+  </style>
+
+  <!-- Firebase Modular SDK via importmap -->
+  <script type="importmap">
+  {
+    "imports": {
+      "firebase/app":       "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js",
+      "firebase/auth":      "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js",
+      "firebase/firestore": "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js"
+    }
+  }
+  </script>
+</head>
+<body>
+<div id="root"><div style="height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;"><div class="spin"></div><div style="font-family:'Playfair Display',serif;font-size:40px;font-style:italic;background:linear-gradient(135deg,#e74c8b,#f59e0b);-webkit-background-clip:text;-webkit-text-fill-color:transparent;">Bloom</div><p style="color:rgba(255,255,255,0.3);font-size:13px;margin-top:8px;">Loading...</p></div></div>
+
+<script type="module">
+import { initializeApp }                                         from "firebase/app";
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword,
+         createUserWithEmailAndPassword, signOut,
+         GoogleAuthProvider, signInWithPopup, updateProfile }    from "firebase/auth";
+import { getFirestore, doc, setDoc, getDoc, getDocs,
+         collection, query, where, onSnapshot, addDoc,
+         serverTimestamp, orderBy, updateDoc,
+         arrayUnion }                                            from "firebase/firestore";
+
+// ── Firebase init ──────────────────────────────────────────────────────────
+const app  = initializeApp({
+  apiKey:            "AIzaSyBOZiXe2x7DHBXhbtkVdeh_OKatMLJvagc",
+  authDomain:        "temi-793d9.firebaseapp.com",
+  projectId:         "temi-793d9",
+  storageBucket:     "temi-793d9.firebasestorage.app",
+  messagingSenderId: "738743824904",
+  appId:             "1:738743824904:web:e9569982fd37619fdbd7bd"
+});
+const AUTH = getAuth(app);
+const DB   = getFirestore(app);
+const GP   = new GoogleAuthProvider();
+
+// ── Cloudinary ─────────────────────────────────────────────────────────────
+const CLD_CLOUD  = "dk6vyp7wx";
+const CLD_PRESET = "Temi_uploads";
+
+async function uploadPhoto(file) {
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("upload_preset", CLD_PRESET);
+  const res  = await fetch(`https://api.cloudinary.com/v1_1/${CLD_CLOUD}/image/upload`, { method:"POST", body:fd });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.secure_url;
+}
+
+// ── Constants ──────────────────────────────────────────────────────────────
+const GRAD = "linear-gradient(135deg,#e74c8b,#f59e0b)";
+const PH   = "https://images.unsplash.com/photo-1511367461989-f85a21fda167?w=400&h=600&fit=crop";
+const IS   = "padding:13px 16px;border-radius:14px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);color:#fff;font-size:14px;outline:none;width:100%;";
+
+// ── State ──────────────────────────────────────────────────────────────────
+let me=null, myProfile=null;
+let discover=[], dIdx=0;
+let chats=[], activeChat=null;
+let unsubMatches=null, unsubChat=null;
+let authMode="login";
+let photoFile=null, photoDataUrl=null;
+let screen="loading";
+
+const R = () => document.getElementById("root");
+
+// ── Auth observer ──────────────────────────────────────────────────────────
+onAuthStateChanged(AUTH, async user => {
+  me = user;
+  if (user) {
+    try {
+      const snap = await getDoc(doc(DB,"users",user.uid));
+      if (snap.exists()) {
+        myProfile = snap.data();
+        await loadDiscover();
+        listenMatches();
+        go("discover");
+      } else {
+        go("onboarding");
+      }
+    } catch(e) { console.error(e); go("onboarding"); }
+  } else {
+    go("auth");
+  }
+});
+
+// ── Load discover profiles ─────────────────────────────────────────────────
+async function loadDiscover() {
+  try {
+    const snap = await getDocs(collection(DB,"users"));
+    const seen = new Set(myProfile?.swipedOn || []);
+    discover = [];
+    snap.forEach(d => { if (d.id !== me.uid && !seen.has(d.id)) discover.push({id:d.id,...d.data()}); });
+    dIdx = 0;
+  } catch(e) { console.error("loadDiscover:",e); }
+}
+
+// ── Swipe ──────────────────────────────────────────────────────────────────
+async function doSwipe(dir, pid) {
+  try {
+    await updateDoc(doc(DB,"users",me.uid), { swipedOn: arrayUnion(pid) });
+    myProfile.swipedOn = [...(myProfile.swipedOn||[]), pid];
+    if (dir === "right") {
+      const theirSnap = await getDoc(doc(DB,"users",pid));
+      const theirData = theirSnap.data() || {};
+      if ((theirData.likedBy||[]).includes(me.uid)) {
+        const mid = [me.uid,pid].sort().join("_");
+        await setDoc(doc(DB,"matches",mid), { users:[me.uid,pid], createdAt:serverTimestamp() }, {merge:true});
+        showMatchModal(discover.find(p=>p.id===pid));
+      } else {
+        await updateDoc(doc(DB,"users",pid), { likedBy: arrayUnion(me.uid) });
+      }
+    }
+  } catch(e) { console.error("swipe:",e); }
+  dIdx++;
+  renderDiscover();
+}
+
+// ── Listen matches ─────────────────────────────────────────────────────────
+function listenMatches() {
+  if (unsubMatches) unsubMatches();
+  const q = query(collection(DB,"matches"), where("users","array-contains",me.uid));
+  unsubMatches = onSnapshot(q, async snap => {
+    chats = [];
+    for (const d of snap.docs) {
+      const data    = d.data();
+      const otherId = data.users.find(u=>u!==me.uid);
+      try {
+        const oSnap = await getDoc(doc(DB,"users",otherId));
+        const mSnap = await getDocs(query(collection(DB,"matches",d.id,"messages"), orderBy("createdAt","desc")));
+        const last  = mSnap.docs[0]?.data();
+        chats.push({
+          matchId: d.id, otherId,
+          name:    oSnap.data()?.name  || "User",
+          photo:   oSnap.data()?.photo || "",
+          lastMsg: last?.text || "Say hello! 👋",
+          time:    last?.createdAt?.toDate?.()?.toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"}) || ""
+        });
+      } catch(e) { console.error("chat load:",e); }
+    }
+    if (screen==="messages" && !activeChat) renderMessages();
+  });
+}
+
+// ── Open chat ──────────────────────────────────────────────────────────────
+function openChat(chat) {
+  activeChat = chat;
+  if (unsubChat) unsubChat();
+  renderChat();
+  const q = query(collection(DB,"matches",chat.matchId,"messages"), orderBy("createdAt","asc"));
+  unsubChat = onSnapshot(q, snap => renderChatMsgs(snap.docs.map(d=>({id:d.id,...d.data()}))));
+}
+
+async function sendMsg(text) {
+  if (!text.trim() || !activeChat) return;
+  await addDoc(collection(DB,"matches",activeChat.matchId,"messages"), {
+    from: me.uid, text: text.trim(), createdAt: serverTimestamp()
+  });
+}
+
+// ── Save profile ───────────────────────────────────────────────────────────
+async function saveProfile(data) {
+  await setDoc(doc(DB,"users",me.uid),
+    { ...data, uid:me.uid, likedBy:[], swipedOn:[], updatedAt:serverTimestamp() },
+    { merge:true });
+  myProfile = { ...myProfile, ...data };
+}
+
+// ==========================================================================
+// RENDER
+// ==========================================================================
+function go(s) {
+  screen = s;
+  if (s !== "messages") { if(unsubChat){unsubChat();unsubChat=null;} activeChat=null; }
+  render();
+}
+
+function render() {
+  const r = R();
+  if (screen==="loading")    { r.innerHTML = loadingHTML(); return; }
+  if (screen==="auth")       { r.innerHTML = authHTML();    return; }
+  if (screen==="onboarding") { r.innerHTML = onboardHTML(); return; }
+  r.innerHTML = `<div id="sc" style="flex:1;overflow:hidden;display:flex;flex-direction:column;"></div>${navHTML()}`;
+  if (screen==="discover") renderDiscover();
+  if (screen==="likes")    renderLikes();
+  if (screen==="messages") renderMessages();
+  if (screen==="profile")  renderProfile();
+}
+
+function loadingHTML() {
+  return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+    <div class="spin"></div>
+    <div style="font-family:'Playfair Display',serif;font-size:40px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;">Bloom</div>
+    <p style="color:rgba(255,255,255,0.3);font-size:13px;margin-top:8px;">Starting up...</p>
+  </div>`;
+}
+
+function errHTML(msg) {
+  return `<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;text-align:center;">
+    <div style="font-size:48px;margin-bottom:16px;">⚠️</div>
+    <div style="font-size:14px;color:rgba(255,255,255,0.6);line-height:1.6;">${msg}</div>
+    <button onclick="location.reload()" style="margin-top:24px;padding:12px 28px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:14px;font-weight:600;">Retry</button>
+  </div>`;
+}
+
+// ── Auth ───────────────────────────────────────────────────────────────────
+function authHTML() {
+  return `<div class="fu" style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;overflow-y:auto;">
+    <div style="font-family:'Playfair Display',serif;font-size:52px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px;">Bloom</div>
+    <p style="color:rgba(255,255,255,0.38);font-size:14px;margin-bottom:36px;">Find your person 🌸</p>
+    <div style="display:flex;background:rgba(255,255,255,0.06);border-radius:30px;padding:4px;width:100%;max-width:320px;margin-bottom:24px;">
+      <button onclick="window._amode('login')"  style="flex:1;padding:10px;border-radius:26px;border:none;background:${authMode==='login'?GRAD:'transparent'};color:#fff;font-weight:600;font-size:14px;">Login</button>
+      <button onclick="window._amode('signup')" style="flex:1;padding:10px;border-radius:26px;border:none;background:${authMode==='signup'?GRAD:'transparent'};color:#fff;font-weight:600;font-size:14px;">Sign Up</button>
+    </div>
+    <div style="width:100%;max-width:320px;display:flex;flex-direction:column;gap:11px;">
+      ${authMode==='signup'?`<input id="a-name" placeholder="Full Name" style="${IS}"/>`:''}
+      <input id="a-email" type="email"     placeholder="Email address" style="${IS}"/>
+      <input id="a-pass"  type="password"  placeholder="Password"      style="${IS}" onkeydown="if(event.key==='Enter')window._asub()"/>
+      <div id="a-err" style="color:#e74c8b;font-size:12px;min-height:16px;text-align:center;"></div>
+      <button onclick="window._asub()" style="padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;">${authMode==='login'?'Login':'Create Account'}</button>
+      <div style="text-align:center;color:rgba(255,255,255,0.25);font-size:13px;">or</div>
+      <button onclick="window._gin()" style="padding:14px;border-radius:50px;border:1px solid rgba(255,255,255,0.14);background:rgba(255,255,255,0.05);color:#fff;font-size:14px;display:flex;align-items:center;justify-content:center;gap:8px;">
+        <svg width="18" height="18" viewBox="0 0 24 24">
+          <path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+          <path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+          <path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+          <path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+        </svg>
+        Continue with Google
+      </button>
+    </div>
+  </div>`;
+}
+
+// ── Onboarding ─────────────────────────────────────────────────────────────
+function onboardHTML() {
+  return `<div class="fu" style="flex:1;overflow-y:auto;padding:28px 24px 40px;">
+    <div style="font-family:'Playfair Display',serif;font-size:24px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;">${myProfile?'Edit Profile':'Your Profile'}</div>
+    <p style="color:rgba(255,255,255,0.4);font-size:13px;margin-bottom:22px;">Tell us about yourself 🌸</p>
+    <div style="display:flex;flex-direction:column;align-items:center;margin-bottom:20px;">
+      <div id="ph-prev" onclick="document.getElementById('ph-inp').click()" style="width:110px;height:110px;border-radius:50%;background:rgba(255,255,255,0.07);border:2px dashed rgba(255,255,255,0.2);display:flex;align-items:center;justify-content:center;font-size:36px;margin-bottom:10px;overflow:hidden;cursor:pointer;">
+        ${photoDataUrl?`<img src="${photoDataUrl}" style="width:100%;height:100%;object-fit:cover;">`
+          :myProfile?.photo?`<img src="${myProfile.photo}" style="width:100%;height:100%;object-fit:cover;">`
+          :'📸'}
+      </div>
+      <input id="ph-inp" type="file" accept="image/*" style="display:none;" onchange="window._pprev(this)"/>
+      <button onclick="document.getElementById('ph-inp').click()" style="padding:7px 18px;border-radius:20px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:rgba(255,255,255,0.55);font-size:13px;">Upload Photo</button>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:11px;">
+      <input id="ob-name" value="${myProfile?.name||''}"     placeholder="Full Name *"                style="${IS}"/>
+      <input id="ob-age"  value="${myProfile?.age||''}"      type="number" placeholder="Age *" min="18" style="${IS}"/>
+      <input id="ob-loc"  value="${myProfile?.location||''}" placeholder="Location (e.g. Accra, Ghana)" style="${IS}"/>
+      <textarea id="ob-bio" rows="3" placeholder="Short bio..." style="${IS}resize:none;">${myProfile?.bio||''}</textarea>
+      <select id="ob-goal" style="${IS}">
+        <option value="" disabled ${!myProfile?.goal?'selected':''}>Looking for... *</option>
+        <option value="Serious"    ${myProfile?.goal==='Serious'   ?'selected':''}>Serious Relationship</option>
+        <option value="Casual"     ${myProfile?.goal==='Casual'    ?'selected':''}>Casual Dating</option>
+        <option value="Friendship" ${myProfile?.goal==='Friendship'?'selected':''}>Friendship</option>
+      </select>
+      <select id="ob-gender" style="${IS}">
+        <option value="" disabled ${!myProfile?.gender?'selected':''}>Gender *</option>
+        <option value="Male"   ${myProfile?.gender==='Male'  ?'selected':''}>Male</option>
+        <option value="Female" ${myProfile?.gender==='Female'?'selected':''}>Female</option>
+        <option value="Other"  ${myProfile?.gender==='Other' ?'selected':''}>Other</option>
+      </select>
+      <input id="ob-int" value="${(myProfile?.interests||[]).join(', ')}" placeholder="Interests: Music, Travel, Art..." style="${IS}"/>
+      <div id="ob-err" style="color:#e74c8b;font-size:13px;min-height:16px;text-align:center;"></div>
+      <button onclick="window._sob()" style="padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;margin-top:4px;">${myProfile?'Save Changes ✓':'Start Matching 🌸'}</button>
+      ${myProfile?`<button onclick="window._go('discover')" style="padding:13px;border-radius:50px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:rgba(255,255,255,0.6);font-size:14px;">Cancel</button>`:''}
+    </div>
+  </div>`;
+}
+
+// ── Nav ────────────────────────────────────────────────────────────────────
+function navHTML() {
+  return `<nav style="flex-shrink:0;background:rgba(10,10,18,0.97);backdrop-filter:blur(20px);border-top:1px solid rgba(255,255,255,0.06);display:flex;justify-content:space-around;padding:12px 0 18px;z-index:50;">
+    ${[{id:"discover",icon:"🔥",label:"Discover"},{id:"likes",icon:"💜",label:"Likes"},{id:"messages",icon:"💬",label:"Chats"},{id:"profile",icon:"👤",label:"Profile"}].map(t=>`
+    <button onclick="window._go('${t.id}')" style="display:flex;flex-direction:column;align-items:center;gap:3px;background:none;border:none;color:${screen===t.id?'#e74c8b':'rgba(255,255,255,0.32)'};font-size:10px;font-weight:${screen===t.id?700:400};min-width:60px;transition:color 0.2s;">
+      <span style="font-size:22px;line-height:1;">${t.icon}</span>${t.label}
+    </button>`).join("")}
+  </nav>`;
+}
+
+// ── Discover ───────────────────────────────────────────────────────────────
+function renderDiscover() {
+  const sc = document.getElementById("sc"); if(!sc) return;
+  const p  = discover[dIdx];
+  sc.innerHTML = `
+    <div style="padding:16px 20px 8px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;">
+      <div style="font-family:'Playfair Display',serif;font-size:28px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;">Bloom</div>
+      <div style="font-size:12px;color:rgba(255,255,255,0.3);">${discover.length-dIdx} profiles</div>
+    </div>
+    <div style="flex:1;display:flex;align-items:center;justify-content:center;padding:0 16px;overflow:hidden;">
+      ${!p ? `
+      <div style="text-align:center;">
+        <div style="font-size:60px;margin-bottom:16px;">🌸</div>
+        <div style="font-family:'Playfair Display',serif;font-size:24px;margin-bottom:8px;">All caught up!</div>
+        <p style="color:rgba(255,255,255,0.4);font-size:14px;margin-bottom:20px;">No more profiles right now</p>
+        <button onclick="window._reload()" style="padding:12px 28px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:14px;font-weight:600;">Refresh 🔄</button>
+      </div>` : `
+      <div style="position:relative;width:100%;max-width:380px;">
+        ${dIdx+1<discover.length?`
+        <div style="position:absolute;top:10px;left:50%;transform:translateX(-50%) scale(0.94);width:100%;height:490px;border-radius:26px;overflow:hidden;opacity:0.4;pointer-events:none;">
+          <img src="${discover[dIdx+1]?.photo||PH}" style="width:100%;height:100%;object-fit:cover;" onerror="this.src='${PH}'"/>
+        </div>`:''}
+        <div id="card" style="position:relative;width:100%;height:490px;border-radius:26px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,0.65);touch-action:none;user-select:none;z-index:1;">
+          <div id="ls" style="position:absolute;top:50px;left:20px;border:4px solid #10b981;color:#10b981;font-weight:700;font-size:26px;padding:5px 14px;border-radius:8px;transform:rotate(-15deg);opacity:0;z-index:10;pointer-events:none;letter-spacing:2px;">LIKE</div>
+          <div id="ns" style="position:absolute;top:50px;right:20px;border:4px solid #e74c8b;color:#e74c8b;font-weight:700;font-size:26px;padding:5px 14px;border-radius:8px;transform:rotate(15deg);opacity:0;z-index:10;pointer-events:none;letter-spacing:2px;">NOPE</div>
+          <img src="${p.photo||PH}" style="width:100%;height:100%;object-fit:cover;pointer-events:none;" draggable="false" onerror="this.src='${PH}'"/>
+          <div style="position:absolute;top:14px;right:14px;background:${GRAD};border-radius:20px;padding:5px 12px;font-size:11px;font-weight:700;">${p.goal||'Dating'}</div>
+          <div style="position:absolute;bottom:0;left:0;right:0;background:linear-gradient(to top,rgba(0,0,0,0.97) 0%,rgba(0,0,0,0.5) 55%,transparent 100%);padding:28px 20px 20px;">
+            <div style="font-family:'Playfair Display',serif;font-size:28px;font-weight:700;">${p.name||'User'}, ${p.age||''}</div>
+            <div style="font-size:12px;color:rgba(255,255,255,0.5);margin:4px 0 8px;">📍 ${p.location||'Nearby'}</div>
+            <div style="font-size:13px;color:rgba(255,255,255,0.82);line-height:1.5;margin-bottom:10px;">${p.bio||''}</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;">${(p.interests||[]).map(i=>`<span style="padding:3px 10px;border-radius:20px;font-size:11px;background:rgba(255,255,255,0.12);">${i}</span>`).join('')}</div>
+          </div>
+        </div>
+      </div>`}
+    </div>
+    ${p?`
+    <div style="display:flex;justify-content:center;align-items:center;gap:18px;padding:14px 0 6px;flex-shrink:0;">
+      <button onclick="window._sw('left','${p.id}')"  style="width:54px;height:54px;border-radius:50%;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);font-size:22px;color:#fff;">✕</button>
+      <button onclick="window._sw('right','${p.id}')" style="width:68px;height:68px;border-radius:50%;border:none;background:${GRAD};font-size:28px;box-shadow:0 8px 28px rgba(231,76,139,0.5);">♥</button>
+      <button onclick="window._sw('left','${p.id}')"  style="width:54px;height:54px;border-radius:50%;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.07);font-size:22px;color:#fff;">⚡</button>
+    </div>`:''}`;
+  if(p) initSwipe(p.id);
+}
+
+function initSwipe(pid) {
+  const card=document.getElementById("card"),ls=document.getElementById("ls"),ns=document.getElementById("ns");
+  if(!card) return;
+  let sx=null,dx=0,done=false;
+  card.addEventListener("touchstart", e=>{sx=e.touches[0].clientX;done=false;},{passive:true});
+  card.addEventListener("touchmove",  e=>{
+    if(!sx||done) return;
+    dx=e.touches[0].clientX-sx;
+    card.style.transform=`translateX(${dx}px) rotate(${dx*0.04}deg)`;
+    card.style.opacity=Math.max(0,1-Math.abs(dx)/300);
+    ls.style.opacity=dx>40?Math.min(1,(dx-40)/80):0;
+    ns.style.opacity=dx<-40?Math.min(1,(-dx-40)/80):0;
+  },{passive:true});
+  card.addEventListener("touchend",()=>{
+    if(done) return;
+    if(Math.abs(dx)>90){
+      done=true; const dir=dx>0?"right":"left";
+      card.style.transition="transform .35s ease,opacity .35s ease";
+      card.style.transform=`translateX(${dir==="right"?160:-160}%) rotate(${dir==="right"?25:-25}deg)`;
+      card.style.opacity=0;
+      setTimeout(()=>doSwipe(dir,pid),360);
+    } else {
+      card.style.transform="";card.style.opacity=1;
+      ls.style.opacity=0;ns.style.opacity=0;
+    }
+    sx=null;dx=0;
+  });
+}
+
+function showMatchModal(p) {
+  const ov=document.createElement("div");
+  ov.style.cssText="position:fixed;inset:0;background:rgba(6,6,14,0.96);z-index:300;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px;text-align:center;color:#fff;font-family:'DM Sans',sans-serif;";
+  ov.innerHTML=`
+    <div style="font-size:64px;margin-bottom:12px;">🎉</div>
+    <div style="font-family:'Playfair Display',serif;font-size:44px;font-style:italic;background:${GRAD};-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px;">It's a Match!</div>
+    <p style="color:rgba(255,255,255,0.5);font-size:15px;margin-bottom:36px;">You and ${p?.name||'someone'} liked each other!</p>
+    <div style="display:flex;justify-content:center;margin-bottom:44px;">
+      <img src="${myProfile?.photo||PH}" style="width:100px;height:100px;border-radius:50%;object-fit:cover;border:3px solid #e74c8b;margin-right:-18px;z-index:1;position:relative;" onerror="this.src='${PH}'"/>
+      <img src="${p?.photo||PH}"         style="width:100px;height:100px;border-radius:50%;object-fit:cover;border:3px solid #f59e0b;" onerror="this.src='${PH}'"/>
+    </div>
+    <button id="mm1" style="width:100%;max-width:320px;padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;margin-bottom:12px;">Send a Message 💬</button>
+    <button id="mm2" style="width:100%;max-width:320px;padding:13px;border-radius:50px;border:1px solid rgba(255,255,255,0.14);background:transparent;color:rgba(255,255,255,0.6);font-size:15px;">Keep Swiping</button>`;
+  document.body.appendChild(ov);
+  ov.querySelector("#mm2").onclick=()=>ov.remove();
+  ov.querySelector("#mm1").onclick=()=>{ov.remove();go("messages");};
+}
+
+// ── Likes ──────────────────────────────────────────────────────────────────
+function renderLikes() {
+  const sc=document.getElementById("sc"); if(!sc) return;
+  sc.innerHTML=`
+    <div style="padding:20px 22px 10px;font-family:'Playfair Display',serif;font-size:26px;font-style:italic;">Who Liked You</div>
+    <p style="padding:0 22px 14px;color:rgba(255,255,255,0.4);font-size:13px;">Upgrade to see who liked you first 💖</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 16px;overflow-y:auto;flex:1;">
+      ${(discover.length?discover:Array(4).fill({})).slice(0,6).map(p=>`
+      <div style="border-radius:18px;overflow:hidden;position:relative;height:200px;">
+        <img src="${p.photo||PH}" style="width:100%;height:100%;object-fit:cover;filter:blur(9px);transform:scale(1.1);" onerror="this.src='${PH}'"/>
+        <div style="position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,0.7),transparent);display:flex;flex-direction:column;justify-content:flex-end;padding:12px;">
+          <div style="font-weight:600;font-size:14px;">Someone, ${p.age||'??'}</div>
+        </div>
+        <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:30px;">🔒</div>
+      </div>`).join("")}
+    </div>
+    <div style="padding:16px;">
+      <button style="width:100%;padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;">Unlock Premium ✨</button>
+    </div>`;
+}
+
+// ── Messages list ──────────────────────────────────────────────────────────
+function renderMessages() {
+  const sc=document.getElementById("sc"); if(!sc) return;
+  sc.innerHTML=`
+    <div style="padding:20px 22px 14px;font-family:'Playfair Display',serif;font-size:26px;font-style:italic;flex-shrink:0;">Messages</div>
+    <div style="flex:1;overflow-y:auto;">
+      ${chats.length===0?`
+      <div style="text-align:center;padding:60px 32px;">
+        <div style="font-size:56px;margin-bottom:16px;">💬</div>
+        <div style="font-family:'Playfair Display',serif;font-size:22px;margin-bottom:8px;">No matches yet</div>
+        <p style="color:rgba(255,255,255,0.4);font-size:14px;">Keep swiping to get your first match!</p>
+      </div>`:
+      chats.map((c,i)=>`
+      <div onclick="window._oc(${i})" style="display:flex;align-items:center;gap:14px;padding:14px 22px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,0.05);" onmouseover="this.style.background='rgba(255,255,255,0.04)'" onmouseout="this.style.background=''">
+        <img src="${c.photo||PH}" style="width:56px;height:56px;border-radius:50%;object-fit:cover;flex-shrink:0;" onerror="this.src='${PH}'"/>
+        <div style="flex:1;min-width:0;">
+          <div style="font-weight:600;font-size:15px;margin-bottom:3px;">${c.name}</div>
+          <div style="font-size:13px;color:rgba(255,255,255,0.38);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.lastMsg}</div>
+        </div>
+        <div style="font-size:11px;color:rgba(255,255,255,0.25);flex-shrink:0;">${c.time}</div>
+      </div>`).join("")}
+    </div>`;
+}
+
+// ── Chat ───────────────────────────────────────────────────────────────────
+function renderChat() {
+  const sc=document.getElementById("sc"); if(!sc||!activeChat) return;
+  sc.innerHTML=`
+    <div style="padding:14px 18px;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:12px;flex-shrink:0;">
+      <button onclick="window._go('messages')" style="background:none;border:none;color:rgba(255,255,255,0.6);font-size:26px;line-height:1;padding:0 6px 0 0;">‹</button>
+      <img src="${activeChat.photo||PH}" style="width:44px;height:44px;border-radius:50%;object-fit:cover;" onerror="this.src='${PH}'"/>
+      <div style="flex:1;">
+        <div style="font-weight:600;font-size:15px;">${activeChat.name}</div>
+        <div style="font-size:11px;color:#10b981;">Matched ✓</div>
+      </div>
+      <button style="background:none;border:none;color:rgba(255,255,255,0.4);font-size:20px;cursor:pointer;">📞</button>
+    </div>
+    <div id="msgs" style="flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:6px;"></div>
+    <div style="padding:12px 16px 28px;display:flex;gap:10px;border-top:1px solid rgba(255,255,255,0.06);flex-shrink:0;">
+      <input id="m-inp" placeholder="Type a message…" style="flex:1;background:rgba(255,255,255,0.07);border:1px solid rgba(255,255,255,0.1);border-radius:24px;padding:12px 18px;color:#fff;font-size:14px;outline:none;" onkeydown="if(event.key==='Enter')window._sm()"/>
+      <button onclick="window._sm()" style="width:48px;height:48px;border-radius:50%;border:none;background:${GRAD};font-size:20px;flex-shrink:0;display:flex;align-items:center;justify-content:center;">➤</button>
+    </div>`;
+}
+
+function renderChatMsgs(msgs) {
+  const c=document.getElementById("msgs"); if(!c) return;
+  c.innerHTML=msgs.map(m=>`
+    <div style="display:flex;justify-content:${m.from===me.uid?'flex-end':'flex-start'};">
+      <div style="max-width:72%;padding:11px 15px;border-radius:${m.from===me.uid?'18px 18px 4px 18px':'18px 18px 18px 4px'};background:${m.from===me.uid?GRAD:'rgba(255,255,255,0.1)'};font-size:14px;line-height:1.45;">${m.text}</div>
+    </div>`).join("");
+  c.scrollTop=c.scrollHeight;
+}
+
+// ── Profile ────────────────────────────────────────────────────────────────
+function renderProfile() {
+  const sc=document.getElementById("sc"); if(!sc||!myProfile) return;
+  sc.innerHTML=`
+    <div style="flex:1;overflow-y:auto;padding-bottom:20px;">
+      <div style="padding:18px 22px 10px;display:flex;align-items:center;justify-content:space-between;">
+        <div style="font-family:'Playfair Display',serif;font-size:24px;font-style:italic;">My Profile</div>
+        <button onclick="window._sout()" style="padding:7px 14px;border-radius:20px;border:1px solid rgba(255,80,80,0.4);background:transparent;color:rgba(255,80,80,0.8);font-size:12px;">Sign Out</button>
+      </div>
+      <div style="margin:0 16px 14px;border-radius:22px;overflow:hidden;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.07);">
+        <img src="${myProfile.photo||PH}" style="width:100%;height:240px;object-fit:cover;" onerror="this.src='${PH}'"/>
+        <div style="padding:18px 20px;">
+          <div style="font-family:'Playfair Display',serif;font-size:24px;margin-bottom:4px;">${myProfile.name||'You'}, ${myProfile.age||''}</div>
+          <div style="font-size:13px;color:rgba(255,255,255,0.4);margin-bottom:14px;">📍 ${myProfile.location||'Somewhere'} · ${myProfile.goal||'Dating'}</div>
+          <div style="display:flex;justify-content:space-around;padding:14px 0;border-top:1px solid rgba(255,255,255,0.07);border-bottom:1px solid rgba(255,255,255,0.07);margin-bottom:14px;">
+            ${[{n:discover.length,l:"Profiles"},{n:chats.length,l:"Matches"},{n:myProfile.gender||"—",l:"Gender"}].map(s=>`
+            <div style="text-align:center;">
+              <div style="font-family:'Playfair Display',serif;font-size:20px;font-weight:700;">${s.n}</div>
+              <div style="font-size:11px;color:rgba(255,255,255,0.38);margin-top:2px;">${s.l}</div>
+            </div>`).join("")}
+          </div>
+          <p style="font-size:13.5px;color:rgba(255,255,255,0.7);line-height:1.6;margin-bottom:14px;">${myProfile.bio||'No bio yet.'}</p>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;">${(myProfile.interests||[]).map(t=>`<span style="padding:4px 12px;border-radius:20px;font-size:11px;background:rgba(255,255,255,0.1);">${t}</span>`).join("")}</div>
+        </div>
+      </div>
+      <div style="padding:0 16px;">
+        <button onclick="window._go('onboarding')" style="width:100%;padding:15px;border-radius:50px;border:none;background:${GRAD};color:#fff;font-size:15px;font-weight:600;">Edit Profile ✏️</button>
+      </div>
+    </div>`;
+}
+
+// ==========================================================================
+// GLOBAL HANDLERS (called from inline onclick)
+// ==========================================================================
+window._amode = m => { authMode=m; go("auth"); };
+
+window._asub = async () => {
+  const email = document.getElementById("a-email")?.value?.trim();
+  const pass  = document.getElementById("a-pass")?.value;
+  const err   = document.getElementById("a-err");
+  if (!email||!pass) { if(err) err.textContent="Please enter email and password."; return; }
+  try {
+    if (authMode==="signup") {
+      const name = document.getElementById("a-name")?.value?.trim();
+      const cred = await createUserWithEmailAndPassword(AUTH,email,pass);
+      if (name) await updateProfile(cred.user,{displayName:name});
+    } else {
+      await signInWithEmailAndPassword(AUTH,email,pass);
+    }
+  } catch(e) {
+    if(err) err.textContent = e.message.replace("Firebase: ","").replace(/\s*\(.*\)/,"");
+  }
+};
+
+window._gin = async () => {
+  try { await signInWithPopup(AUTH,GP); }
+  catch(e) { console.error("Google sign-in:",e); }
+};
+
+window._pprev = input => {
+  photoFile = input.files[0]; if(!photoFile) return;
+  const fr=new FileReader();
+  fr.onload=e=>{ photoDataUrl=e.target.result; const p=document.getElementById("ph-prev"); if(p) p.innerHTML=`<img src="${photoDataUrl}" style="width:100%;height:100%;object-fit:cover;">`; };
+  fr.readAsDataURL(photoFile);
+};
+
+window._sob = async () => {
+  const name   = document.getElementById("ob-name")?.value?.trim();
+  const age    = document.getElementById("ob-age")?.value;
+  const loc    = document.getElementById("ob-loc")?.value?.trim();
+  const bio    = document.getElementById("ob-bio")?.value?.trim();
+  const goal   = document.getElementById("ob-goal")?.value;
+  const gender = document.getElementById("ob-gender")?.value;
+  const ints   = document.getElementById("ob-int")?.value?.split(",").map(s=>s.trim()).filter(Boolean);
+  const err    = document.getElementById("ob-err");
+  if (!name||!age||!goal||!gender) { if(err) err.textContent="Please fill in all required fields (*)."; return; }
+  if (parseInt(age)<18) { if(err) err.textContent="You must be at least 18."; return; }
+  if(err) err.textContent="Saving...";
+  let photo = myProfile?.photo||"";
+  if (photoFile) {
+    try { photo=await uploadPhoto(photoFile); photoFile=null; photoDataUrl=null; }
+    catch(e) { console.error("Photo upload:",e); if(err) err.textContent="Photo upload failed — saving without photo."; }
+  }
+  try {
+    await saveProfile({name,age:parseInt(age),location:loc,bio,goal,gender,interests:ints,photo});
+    await loadDiscover();
+    listenMatches();
+    go("discover");
+  } catch(e) { if(err) err.textContent=e.message; }
+};
+
+window._sw = (dir,pid) => {
+  const card=document.getElementById("card"); if(!card) return;
+  card.style.transition="transform .35s ease,opacity .35s ease";
+  card.style.transform=`translateX(${dir==="right"?160:-160}%) rotate(${dir==="right"?25:-25}deg)`;
+  card.style.opacity=0;
+  setTimeout(()=>doSwipe(dir,pid),360);
+};
+
+window._reload = async () => { await loadDiscover(); renderDiscover(); };
+window._oc     = i => openChat(chats[i]);
+window._sm     = () => { const i=document.getElementById("m-inp"); if(i){sendMsg(i.value);i.value="";} };
+window._sout   = async () => { if(unsubMatches){unsubMatches();} if(unsubChat){unsubChat();} await signOut(AUTH); };
+window._go     = s => { if(s==="messages"&&activeChat){activeChat=null;} go(s); };
+
+</script>
+</body>
+</html>
